@@ -2,28 +2,22 @@ import { useEffect, useRef, useState } from "react";
 import { client } from "@gradio/client";
 
 /**
- * Chat UI wired to a Gradio v5 Space using the official JS client.
- * - The client handles queueing/stream protocols automatically.
- * - We call the exported function name: "/chat".
- * - No localStorage persistence (reload = fresh chat).
+ * Chat UI using @gradio/client queue/stream flow.
+ * - Space must be Public (no token). If Private, pass { hf_token: "HF_..." } to client().
+ * - We call the function route "/chat" (api_name in your Space config).
+ * - Uses submit() + for-await events() to handle status/token/data events.
+ * - No localStorage persistence.
  */
 
 const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
-const FN_ROUTE = "/chat"; // matches api_name in your config
+const FN_ROUTE = "/chat";
 
-console.log("BUILD:", "gradio-client-2025-11-06");
-
-
-// --------------- Singleton Gradio client -----------------
-let _appPromise = null;
-async function getGradioApp() {
-  if (!_appPromise) _appPromise = client(SPACE_URL);
-  return _appPromise;
-}
+// Build marker to verify you’re on this file
+console.log("BUILD:", "gradio-client-queue-stream-OK");
 
 // ---------------------- HF state between turns -------------------------------
 function useHfState() {
-  const ref = useRef(null); // Space "state" object between turns
+  const ref = useRef(null); // Space "state" component value
   return {
     get: () => ref.current,
     set: (v) => (ref.current = v),
@@ -42,7 +36,7 @@ function extractAssistantText(resp) {
     if (typeof resp.message === "string") return resp.message;
     if (typeof resp.assistant === "string") return resp.assistant;
 
-    // Chat-style: { messages: [{role, content}, ...] }
+    // { messages: [{role, content}, ...] }
     if (Array.isArray(resp.messages)) {
       const last = [...resp.messages].reverse().find((m) => m?.role === "assistant");
       if (last) {
@@ -51,7 +45,7 @@ function extractAssistantText(resp) {
       }
     }
 
-    // Array of messages OR [["user","..."],["assistant","..."]]
+    // Array of message objects or [["user","..."],["assistant","..."]]
     if (Array.isArray(resp)) {
       const looksLikeMsgs = resp.every(
         (m) => m && typeof m === "object" && "role" in m && "content" in m
@@ -63,11 +57,11 @@ function extractAssistantText(resp) {
           if (last.content && typeof last.content.text === "string") return last.content.text;
         }
       }
-      const pair = resp[resp.length - 1];
-      if (Array.isArray(pair) && typeof pair[1] === "string") return pair[1];
+      const lastPair = resp[resp.length - 1];
+      if (Array.isArray(lastPair) && typeof lastPair[1] === "string") return lastPair[1];
     }
 
-    // ComponentMessage: { value: ... }
+    // ComponentMessage { value: ... }
     if (resp.value) {
       const v = resp.value;
       if (typeof v === "string") return v;
@@ -77,35 +71,60 @@ function extractAssistantText(resp) {
       }
     }
   }
-
   return null;
 }
 
-// ------------------------ Call Space via @gradio/client ----------------------
-async function callSpace(message, hfState) {
-  const app = await getGradioApp();
-  // Predict returns the final result; the client takes care of the queue.
-  const result = await app.predict(FN_ROUTE, [
-    message,                 // textbox
-    hfState.get(),           // state (null on first call)
-    "You are a friendly Chatbot.", // system message
-    512,                     // max new tokens
-    0.7,                     // temperature
-    0.95,                    // top-p
+// ------------------------ Queue/stream call via @gradio/client ---------------
+async function callSpaceStreaming(message, hfState, onChunk) {
+  // If your Space is Private, pass token: client(SPACE_URL, { hf_token: "HF_xxx" })
+  const app = await client(SPACE_URL);
+
+  // Submit the job to the queue; Space will emit status/token/data events.
+  const session = await app.submit(FN_ROUTE, [
+    message,                       // textbox
+    hfState.get(),                 // state (null first call)
+    "You are a friendly Chatbot.", // system message (adjust as you want)
+    512,                           // max new tokens
+    0.7,                           // temperature
+    0.95,                          // top-p
   ]);
 
-  // Expect: { data: [resp, new_state] }
-  const [resp, newState] = result?.data ?? [];
-  if (newState !== undefined) hfState.set(newState);
-  const text = extractAssistantText(resp);
-  return { text: text ?? null, raw: result };
+  let finalText = "";
+  let nextState;
+
+  for await (const ev of session.events()) {
+    // You’ll see these in DevTools if you log ev:
+    // { type: "status" | "token" | "data" | "log" | "error", ... }
+    if (ev.type === "token") {
+      // Streaming delta/token (some Spaces emit this)
+      if (typeof ev.data === "string") {
+        finalText += ev.data;
+        onChunk?.(finalText);
+      }
+    } else if (ev.type === "data") {
+      // Final payload for this run: { data: [resp, new_state] }
+      const [resp, newState] = ev.data ?? [];
+      if (newState !== undefined) nextState = newState;
+      const text = extractAssistantText(resp) ?? JSON.stringify(resp);
+      finalText = text || finalText;
+      onChunk?.(finalText); // ensure UI shows final
+    } else if (ev.type === "error") {
+      throw new Error(ev.data || "Gradio error");
+    } else {
+      // status/log: optional to display
+      // console.debug("gradio event:", ev);
+    }
+  }
+
+  if (nextState !== undefined) hfState.set(nextState);
+  return finalText || null;
 }
 
-// ------------------------------- UI -----------------------------------------
+// --------------------------------- UI ----------------------------------------
 export default function App() {
   const hfState = useHfState();
 
-  // No persistence: fresh greeting on load/reload
+  // No persistence: fresh greeting on load
   const [messages, setMessages] = useState([
     { role: "assistant", content: "Hi there 👋 How can I help you today?" },
   ]);
@@ -115,10 +134,7 @@ export default function App() {
   const chatRef = useRef(null);
 
   useEffect(() => {
-    chatRef.current?.scrollTo({
-      top: chatRef.current.scrollHeight,
-      behavior: "smooth",
-    });
+    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
   function append(role, content) {
@@ -146,15 +162,20 @@ export default function App() {
     append("user", text);
     setInput("");
 
+    // Start an empty assistant bubble immediately
+    append("assistant", "");
+
     try {
       setIsTyping(true);
-      append("assistant", "");
-      const { text: respText, raw } = await callSpace(text, hfState);
-      const finalText = respText ?? `🔎 Debug: ${JSON.stringify(raw, null, 2)}`;
-      replaceLastAssistant(finalText);
+      const final = await callSpaceStreaming(text, hfState, (partial) => {
+        replaceLastAssistant(partial);
+      });
+      if (!final) {
+        replaceLastAssistant("⚠️ No text returned.");
+      }
     } catch (err) {
       console.error(err);
-      replaceLastAssistant("⚠️ Connection error.");
+      replaceLastAssistant("⚠️ Connection error (see Console).");
     } finally {
       setIsTyping(false);
     }
