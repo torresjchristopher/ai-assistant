@@ -110,7 +110,7 @@ async function callSpaceStreaming(message, hfState, onChunk) {
     } else if (ev.type === "error") {
       throw new Error(ev.data || "Gradio error");
     } else {
-      // status/log -> optional to display; you can show a spinner if desired
+      // status/log -> optional to display
       // console.debug("gradio event:", ev);
     }
   }
