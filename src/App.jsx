@@ -23,6 +23,7 @@ function useHfState() {
 // ------------------------- Extractor for common shapes -----------------------
 function extractAssistantText(resp) {
   if (resp == null) return null;
+
   if (typeof resp === "string") return resp;
 
   if (typeof resp === "object") {
@@ -31,7 +32,7 @@ function extractAssistantText(resp) {
     if (typeof resp.message === "string") return resp.message;
     if (typeof resp.assistant === "string") return resp.assistant;
 
-    // Chat-style: { messages: [{role, content}, ...] }
+    // Chat-style shapes
     if (Array.isArray(resp.messages)) {
       const last = [...resp.messages].reverse().find((m) => m?.role === "assistant");
       if (last) {
@@ -40,11 +41,9 @@ function extractAssistantText(resp) {
       }
     }
 
-    // Array of messages OR [["user","..."],["assistant","..."]]
     if (Array.isArray(resp)) {
-      const looksLikeMsgs = resp.every(
-        (m) => m && typeof m === "object" && "role" in m && "content" in m
-      );
+      // Array of message objects
+      const looksLikeMsgs = resp.every((m) => m && typeof m === "object" && "role" in m && "content" in m);
       if (looksLikeMsgs) {
         const last = [...resp].reverse().find((m) => m.role === "assistant");
         if (last) {
@@ -52,11 +51,12 @@ function extractAssistantText(resp) {
           if (last.content && typeof last.content.text === "string") return last.content.text;
         }
       }
-      const pair = resp[resp.length - 1];
-      if (Array.isArray(pair) && typeof pair[1] === "string") return pair[1];
+      // Pair format: ["role","content"]
+      const lastPair = resp[resp.length - 1];
+      if (Array.isArray(lastPair) && typeof lastPair[1] === "string") return lastPair[1];
     }
 
-    // ComponentMessage: { value: ... }
+    // ComponentMessage { value: ... }
     if (resp.value) {
       const v = resp.value;
       if (typeof v === "string") return v;
@@ -70,18 +70,12 @@ function extractAssistantText(resp) {
   return null;
 }
 
+
 // ------------------------ Streaming via fetch + SSE --------------------------
-async function streamHuggingFace(message, hfState, { onChunk } = {}) {
-  // 1) Kick off the job to get event_id
+async function streamOrPollHf(message, hfState, { onChunk } = {}) {
+  // 1) Request -> event_id
   const payload = {
-    data: [
-      message,                 // textbox
-      hfState.get(),           // state (null on first call)
-      "You are a friendly Chatbot.", // system message
-      512,                     // max new tokens
-      0.7,                     // temperature
-      0.95,                    // top-p
-    ],
+    data: [message, hfState.get(), "You are a friendly Chatbot.", 512, 0.7, 0.95],
   };
 
   let callRes;
@@ -97,19 +91,19 @@ async function streamHuggingFace(message, hfState, { onChunk } = {}) {
 
   if (!callRes.ok && callRes.status === 503) {
     await new Promise((r) => setTimeout(r, 1200));
-    return streamHuggingFace(message, hfState, { onChunk });
+    return streamOrPollHf(message, hfState, { onChunk });
   }
 
   let callJson;
   try {
     callJson = await callRes.json();
-  } catch (e) {
+  } catch {
     return { finalText: null, raw: { error: "parse_call", status: callRes.status } };
   }
 
   const eventId = callJson?.event_id;
+  // Some Spaces return final data directly:
   if (!eventId) {
-    // Some Spaces return data directly (non-stream)
     const direct = callJson?.data;
     if (Array.isArray(direct) && direct.length) {
       const [resp, newState] = direct;
@@ -119,25 +113,62 @@ async function streamHuggingFace(message, hfState, { onChunk } = {}) {
     return { finalText: null, raw: callJson };
   }
 
-  // 2) Stream with fetch (ReadableStream). More reliable cross-origin than EventSource in some setups.
-  let res;
-  try {
-    res = await fetch(`${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`, {
-      method: "GET",
-      headers: { Accept: "text/event-stream" },
-    });
-  } catch (e) {
-    return { finalText: null, raw: { error: "stream_connect", detail: String(e), event_id: eventId } };
+  // 2) Try streaming endpoints in order
+  const streamUrls = [
+    `${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`,
+    `${HF_ROOT}/stream/${encodeURIComponent(eventId)}`, // alt pattern
+  ];
+
+  for (const url of streamUrls) {
+    const streamed = await trySseFetch(url, hfState, onChunk);
+    if (streamed?.ok) return { finalText: streamed.finalText ?? null, raw: { stream_url: url } };
+    // if it failed with 405/404, we’ll fall through to results
   }
 
+  // 3) Poll possible result endpoints
+  const resultUrls = [
+    `${HF_ROOT}/result/${encodeURIComponent(eventId)}`,
+    `${HF_ROOT}/result/${HF_FN}/${encodeURIComponent(eventId)}`, // alt pattern
+  ];
+
+  const started = Date.now();
+  const TIMEOUT_MS = 20_000;
+  while (Date.now() - started < TIMEOUT_MS) {
+    for (const rurl of resultUrls) {
+      try {
+        const r = await fetch(rurl);
+        if (r.ok) {
+          const j = await r.json();
+          if (Array.isArray(j?.data)) {
+            const [resp, newState] = j.data;
+            if (newState !== undefined) hfState.set(newState);
+            const text = extractAssistantText(resp) ?? JSON.stringify(resp);
+            return { finalText: text, raw: { result_url: rurl } };
+          }
+        }
+      } catch {}
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+
+  // 4) Nothing worked – surface the event_id for backend tuning
+  return { finalText: null, raw: { error: "no_stream_or_result", event_id: eventId } };
+}
+
+// Helper: parse SSE via fetch + ReadableStream
+async function trySseFetch(url, hfState, onChunk) {
+  let res;
+  try {
+    res = await fetch(url, { headers: { Accept: "text/event-stream" } });
+  } catch (e) {
+    return { ok: false, error: "stream_connect", detail: String(e) };
+  }
   if (!res.ok) {
-    return { finalText: null, raw: { error: "stream_status", status: res.status, event_id: eventId } };
+    return { ok: false, error: "stream_status", status: res.status };
   }
 
   const reader = res.body?.getReader();
-  if (!reader) {
-    return { finalText: null, raw: { error: "no_reader", event_id: eventId } };
-  }
+  if (!reader) return { ok: false, error: "no_reader" };
 
   const decoder = new TextDecoder();
   let buffer = "";
@@ -148,62 +179,43 @@ async function streamHuggingFace(message, hfState, { onChunk } = {}) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
 
-      // Split into SSE frames (double newline)
       const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? ""; // keep incomplete tail
+      buffer = frames.pop() ?? "";
 
       for (const f of frames) {
-        // each frame may include multiple lines; we want the "data:" line
         const dataLine = f.split("\n").find((l) => l.startsWith("data:"));
         if (!dataLine) continue;
-
         const jsonStr = dataLine.replace(/^data:\s*/, "").trim();
         if (!jsonStr) continue;
 
         let obj;
-        try {
-          obj = JSON.parse(jsonStr);
-        } catch {
-          continue; // keep-alives, non-JSON frames
-        }
+        try { obj = JSON.parse(jsonStr); } catch { continue; }
 
-        // Possible patterns:
-        // - { data: { delta: "..." } }    (chunk)
-        // - { delta: "..." }              (chunk)
-        // - { chunk: "..." } / { token: "..." } (chunk)
-        // - { data: [resp, new_state] }   (final/full)
         const delta = obj?.data?.delta ?? obj?.delta ?? obj?.chunk ?? obj?.token;
         if (typeof delta === "string" && delta) {
           finalText += delta;
           onChunk?.(finalText);
           continue;
         }
-
         if (Array.isArray(obj?.data)) {
           const [resp, newState] = obj.data;
           if (newState !== undefined) newStateCaptured = newState;
           const text = extractAssistantText(resp) ?? JSON.stringify(resp);
           if (text) {
-            finalText = text; // ensure final text captured
+            finalText = text;
             onChunk?.(finalText);
           }
-          // do not return immediately; stream may signal completion after
-        }
-
-        if (obj?.type === "complete" || obj?.event === "end" || obj?.done === true) {
-          // completion hint; loop will end when reader finishes
         }
       }
     }
   } catch (e) {
-    return { finalText: finalText || null, raw: { error: "stream_read", detail: String(e), event_id: eventId } };
+    return { ok: false, error: "stream_read", detail: String(e) };
   }
 
   if (newStateCaptured !== undefined) hfState.set(newStateCaptured);
-  return { finalText: finalText || null, raw: { event_id: eventId } };
+  return { ok: true, finalText };
 }
 
 // ------------------------------- UI -----------------------------------------
@@ -251,24 +263,22 @@ export default function App() {
     append("user", text);
     setInput("");
 
-    // Start an empty assistant bubble immediately
-    append("assistant", "");
+append("assistant", "");
 
-    try {
-      setIsTyping(true);
-      const { finalText, raw } = await streamHuggingFace(text, hfState, {
-        onChunk: (chunk) => replaceLastAssistant(chunk),
-      });
-
-      if (!finalText) {
-        replaceLastAssistant(`🔎 Debug (SSE):\n${JSON.stringify(raw, null, 2)}`);
-      }
-    } catch (err) {
-      console.error(err);
-      replaceLastAssistant("⚠️ Connection error.");
-    } finally {
-      setIsTyping(false);
-    }
+try {
+  setIsTyping(true);
+  const { finalText, raw } = await streamOrPollHf(text, hfState, {
+    onChunk: (chunk) => replaceLastAssistant(chunk),
+  });
+  if (!finalText) {
+    replaceLastAssistant(`🔎 Debug: ${JSON.stringify(raw, null, 2)}`);
+  }
+} catch (err) {
+  console.error(err);
+  replaceLastAssistant("⚠️ Connection error.");
+} finally {
+  setIsTyping(false);
+}
   }
 
   function resetConversation() {
