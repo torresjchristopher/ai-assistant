@@ -1,121 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 
-// --- Hugging Face / Gradio v5 wiring ---------------------------------------
+/**
+ * Chat UI wired to a Gradio v5 Space using event_id + streaming.
+ * - POST /gradio_api/call/chat  → { event_id }
+ * - GET  /gradio_api/stream/chat?event_id=...  (SSE via fetch/ReadableStream)
+ * - No localStorage persistence.
+ */
+
 const HF_ROOT = "https://torresjchristopher-ai-assistant.hf.space/gradio_api";
 const HF_FN = "chat";
 
-// ---- Streaming helpers -----------------------------------------------------
-// Try true SSE streaming first, fall back to a result endpoint if needed.
-async function streamHuggingFace(message, hfState, { onChunk } = {}) {
-  // 1) Kick off the job -> event_id
-  const payload = {
-    data: [
-      message,
-      hfState.get(),
-      "You are a friendly Chatbot.",
-      512,
-      0.7,
-      0.95,
-    ],
+// ---------------------- HF state between turns -------------------------------
+function useHfState() {
+  const ref = useRef(null); // Space "state" object
+  return {
+    get: () => ref.current,
+    set: (v) => (ref.current = v),
+    reset: () => (ref.current = null),
   };
-
-  const callRes = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!callRes.ok && callRes.status === 503) {
-    await new Promise((r) => setTimeout(r, 1200));
-    return streamHuggingFace(message, hfState, { onChunk });
-  }
-  const callJson = await callRes.json();
-  const eventId = callJson?.event_id;
-  if (!eventId) {
-    // Some Spaces still return data directly (rare). Handle that too.
-    const direct = callJson?.data;
-    if (Array.isArray(direct) && direct.length) {
-      const [resp, newState] = direct;
-      if (newState !== undefined) hfState.set(newState);
-      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: callJson };
-    }
-    return { finalText: null, raw: callJson };
-  }
-
-  // 2) Try EventSource streaming
-  let buffer = "";
-  let resolved = false;
-
-  const result = await new Promise((resolve) => {
-    let es;
-    try {
-      es = new EventSource(`${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`);
-    } catch (e) {
-      resolve(null);
-      return;
-    }
-
-    es.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        // Common patterns:
-        // - { data: [resp, new_state] } (final)
-        // - { data: { delta: "text" } } (chunk)
-        // - { delta: "text" } or { chunk: "text" } (chunk)
-        // - { type: "complete" } (done)
-        if (Array.isArray(data?.data)) {
-          const [resp, newState] = data.data;
-          if (newState !== undefined) hfState.set(newState);
-          const text = extractAssistantText(resp) ?? JSON.stringify(resp);
-          buffer = text; // ensure we have the final
-          return; // keep listening for a completion signal
-        }
-        const delta = data?.data?.delta ?? data?.delta ?? data?.chunk ?? data?.token;
-        if (typeof delta === "string" && delta) {
-          buffer += delta;
-          onChunk?.(buffer);
-        }
-        if (data?.type === "complete" || data?.event === "end" || data?.done === true) {
-          if (!resolved) {
-            resolved = true;
-            es.close();
-            resolve({ finalText: buffer || null, raw: data });
-          }
-        }
-      } catch (_) {
-        // Non-JSON keep-alives; ignore
-      }
-    };
-
-    es.onerror = () => {
-      if (!resolved) {
-        es.close();
-        resolve(null); // fall back to /result
-      }
-    };
-  });
-
-  if (result) return result;
-
-  // 3) Fallback: poll a likely result endpoint
-  try {
-    const res2 = await fetch(`${HF_ROOT}/result/${eventId}`);
-    if (res2.ok) {
-      const j = await res2.json();
-      const [resp, newState] = j?.data ?? [];
-      if (newState !== undefined) hfState.set(newState);
-      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: j };
-    }
-  } catch (_) {}
-
-  // 4) Last resort: return the event id for debugging
-  return { finalText: null, raw: { event_id: eventId } };
 }
 
-// Robust extractor for common Gradio response shapes.
-function extractAssistantText(resp)(resp) {
+// ------------------------- Extractor for common shapes -----------------------
+function extractAssistantText(resp) {
   if (resp == null) return null;
-
   if (typeof resp === "string") return resp;
 
   if (typeof resp === "object") {
@@ -124,7 +31,7 @@ function extractAssistantText(resp)(resp) {
     if (typeof resp.message === "string") return resp.message;
     if (typeof resp.assistant === "string") return resp.assistant;
 
-    // Chat-style shapes
+    // Chat-style: { messages: [{role, content}, ...] }
     if (Array.isArray(resp.messages)) {
       const last = [...resp.messages].reverse().find((m) => m?.role === "assistant");
       if (last) {
@@ -133,9 +40,11 @@ function extractAssistantText(resp)(resp) {
       }
     }
 
+    // Array of messages OR [["user","..."],["assistant","..."]]
     if (Array.isArray(resp)) {
-      // Array of message objects
-      const looksLikeMsgs = resp.every((m) => m && typeof m === "object" && "role" in m && "content" in m);
+      const looksLikeMsgs = resp.every(
+        (m) => m && typeof m === "object" && "role" in m && "content" in m
+      );
       if (looksLikeMsgs) {
         const last = [...resp].reverse().find((m) => m.role === "assistant");
         if (last) {
@@ -143,12 +52,11 @@ function extractAssistantText(resp)(resp) {
           if (last.content && typeof last.content.text === "string") return last.content.text;
         }
       }
-      // Pair format: ["role", "content"]
-      const lastPair = resp[resp.length - 1];
-      if (Array.isArray(lastPair) && typeof lastPair[1] === "string") return lastPair[1];
+      const pair = resp[resp.length - 1];
+      if (Array.isArray(pair) && typeof pair[1] === "string") return pair[1];
     }
 
-    // ComponentMessage { value: ... }
+    // ComponentMessage: { value: ... }
     if (resp.value) {
       const v = resp.value;
       if (typeof v === "string") return v;
@@ -162,79 +70,147 @@ function extractAssistantText(resp)(resp) {
   return null;
 }
 
-async function callHuggingFace(message, hfState) {
+// ------------------------ Streaming via fetch + SSE --------------------------
+async function streamHuggingFace(message, hfState, { onChunk } = {}) {
+  // 1) Kick off the job to get event_id
   const payload = {
     data: [
-      message, // textbox
-      hfState.get(), // state (null on first call)
-      "You are a friendly Chatbot.", // system prompt
-      512, // max new tokens
-      0.7, // temperature
-      0.95, // top-p
+      message,                 // textbox
+      hfState.get(),           // state (null on first call)
+      "You are a friendly Chatbot.", // system message
+      512,                     // max new tokens
+      0.7,                     // temperature
+      0.95,                    // top-p
     ],
   };
 
-  let res;
-  let json;
+  let callRes;
   try {
-    res = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
+    callRes = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-  } catch (networkErr) {
-    return { text: null, raw: { error: "network", detail: String(networkErr) } };
+  } catch (e) {
+    return { finalText: null, raw: { error: "network_call", detail: String(e) } };
   }
 
-  // Cold start retry
-  if (!res.ok && res.status === 503) {
+  if (!callRes.ok && callRes.status === 503) {
     await new Promise((r) => setTimeout(r, 1200));
-    res = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    return streamHuggingFace(message, hfState, { onChunk });
   }
+
+  let callJson;
+  try {
+    callJson = await callRes.json();
+  } catch (e) {
+    return { finalText: null, raw: { error: "parse_call", status: callRes.status } };
+  }
+
+  const eventId = callJson?.event_id;
+  if (!eventId) {
+    // Some Spaces return data directly (non-stream)
+    const direct = callJson?.data;
+    if (Array.isArray(direct) && direct.length) {
+      const [resp, newState] = direct;
+      if (newState !== undefined) hfState.set(newState);
+      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: callJson };
+    }
+    return { finalText: null, raw: callJson };
+  }
+
+  // 2) Stream with fetch (ReadableStream). More reliable cross-origin than EventSource in some setups.
+  let res;
+  try {
+    res = await fetch(`${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`, {
+      method: "GET",
+      headers: { Accept: "text/event-stream" },
+    });
+  } catch (e) {
+    return { finalText: null, raw: { error: "stream_connect", detail: String(e), event_id: eventId } };
+  }
+
+  if (!res.ok) {
+    return { finalText: null, raw: { error: "stream_status", status: res.status, event_id: eventId } };
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    return { finalText: null, raw: { error: "no_reader", event_id: eventId } };
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalText = "";
+  let newStateCaptured = undefined;
 
   try {
-    json = await res.json();
-  } catch (parseErr) {
-    return { text: null, raw: { error: "parse", status: res.status, statusText: res.statusText } };
-  }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-  const data = json?.data;
-  if (!Array.isArray(data) || data.length < 1) {
-    return { text: null, raw: { error: "shape", status: res.status, body: json } };
-  }
+      buffer += decoder.decode(value, { stream: true });
 
-  const [resp, newState] = data;
-  if (newState !== undefined) hfState.set(newState);
+      // Split into SSE frames (double newline)
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? ""; // keep incomplete tail
 
-  const text = extractAssistantText(resp);
-  return { text: text ?? null, raw: resp, full: json };
-}
+      for (const f of frames) {
+        // each frame may include multiple lines; we want the "data:" line
+        const dataLine = f.split("\n").find((l) => l.startsWith("data:"));
+        if (!dataLine) continue;
 
-function typeOut(fullText, cps = 18, onUpdate) {
-  const delay = 60; // ms
-  return new Promise((resolve) => {
-    let i = 0;
-    let buf = "";
-    const t = setInterval(() => {
-      buf += fullText.slice(i, i + cps);
-      i += cps;
-      onUpdate(buf);
-      if (i >= fullText.length) {
-        clearInterval(t);
-        resolve();
+        const jsonStr = dataLine.replace(/^data:\s*/, "").trim();
+        if (!jsonStr) continue;
+
+        let obj;
+        try {
+          obj = JSON.parse(jsonStr);
+        } catch {
+          continue; // keep-alives, non-JSON frames
+        }
+
+        // Possible patterns:
+        // - { data: { delta: "..." } }    (chunk)
+        // - { delta: "..." }              (chunk)
+        // - { chunk: "..." } / { token: "..." } (chunk)
+        // - { data: [resp, new_state] }   (final/full)
+        const delta = obj?.data?.delta ?? obj?.delta ?? obj?.chunk ?? obj?.token;
+        if (typeof delta === "string" && delta) {
+          finalText += delta;
+          onChunk?.(finalText);
+          continue;
+        }
+
+        if (Array.isArray(obj?.data)) {
+          const [resp, newState] = obj.data;
+          if (newState !== undefined) newStateCaptured = newState;
+          const text = extractAssistantText(resp) ?? JSON.stringify(resp);
+          if (text) {
+            finalText = text; // ensure final text captured
+            onChunk?.(finalText);
+          }
+          // do not return immediately; stream may signal completion after
+        }
+
+        if (obj?.type === "complete" || obj?.event === "end" || obj?.done === true) {
+          // completion hint; loop will end when reader finishes
+        }
       }
-    }, delay);
-  });
+    }
+  } catch (e) {
+    return { finalText: finalText || null, raw: { error: "stream_read", detail: String(e), event_id: eventId } };
+  }
+
+  if (newStateCaptured !== undefined) hfState.set(newStateCaptured);
+  return { finalText: finalText || null, raw: { event_id: eventId } };
 }
 
+// ------------------------------- UI -----------------------------------------
 export default function App() {
   const hfState = useHfState();
 
-  // No persistence: initialize with a single assistant greeting
+  // No persistence: fresh greeting on load/reload
   const [messages, setMessages] = useState([
     { role: "assistant", content: "Hi there 👋 How can I help you today?" },
   ]);
@@ -244,7 +220,10 @@ export default function App() {
   const chatRef = useRef(null);
 
   useEffect(() => {
-    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
+    chatRef.current?.scrollTo({
+      top: chatRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [messages]);
 
   function append(role, content) {
@@ -272,18 +251,21 @@ export default function App() {
     append("user", text);
     setInput("");
 
-    try {
-      const { text: respText, raw, full } = await callHuggingFace(text, hfState);
-      const finalText =
-        respText ?? `🔎 Debug (status unknown):
-${JSON.stringify(full ?? raw, null, 2)}`;
+    // Start an empty assistant bubble immediately
+    append("assistant", "");
 
+    try {
       setIsTyping(true);
-      append("assistant", "");
-      await typeOut(finalText, 18, (chunk) => replaceLastAssistant(chunk));
+      const { finalText, raw } = await streamHuggingFace(text, hfState, {
+        onChunk: (chunk) => replaceLastAssistant(chunk),
+      });
+
+      if (!finalText) {
+        replaceLastAssistant(`🔎 Debug (SSE):\n${JSON.stringify(raw, null, 2)}`);
+      }
     } catch (err) {
       console.error(err);
-      append("assistant", "⚠️ Connection error.");
+      replaceLastAssistant("⚠️ Connection error.");
     } finally {
       setIsTyping(false);
     }
@@ -330,7 +312,10 @@ ${JSON.stringify(full ?? raw, null, 2)}`;
             placeholder="Type your message…"
             className="flex-1 px-4 py-3 rounded-lg bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
-          <button type="submit" className="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 font-semibold">
+          <button
+            type="submit"
+            className="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 font-semibold"
+          >
             Send
           </button>
         </div>
@@ -345,7 +330,9 @@ function Message({ role, content }) {
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
         className={`max-w-[80%] px-4 py-3 rounded-2xl leading-relaxed ${
-          isUser ? "bg-blue-600 text-white rounded-br-sm" : "bg-gray-800 text-gray-100 rounded-bl-sm"
+          isUser
+            ? "bg-blue-600 text-white rounded-br-sm"
+            : "bg-gray-800 text-gray-100 rounded-bl-sm"
         }`}
       >
         {content}
@@ -365,5 +352,10 @@ function TypingDots() {
 }
 
 function Dot({ delay }) {
-  return <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-pulse" style={{ animationDelay: delay }} />;
+  return (
+    <span
+      className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-pulse"
+      style={{ animationDelay: delay }}
+    />
+  );
 }
