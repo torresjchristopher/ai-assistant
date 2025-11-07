@@ -11,6 +11,9 @@ import { client } from "@gradio/client";
 const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
 const FN_ROUTE = "/chat"; // matches api_name in your config
 
+console.log("BUILD:", "gradio-client-2025-11-06");
+
+
 // --------------- Singleton Gradio client -----------------
 let _appPromise = null;
 async function getGradioApp() {
