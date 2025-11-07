@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import axios from "axios";
 
-const API_URL = "https://your-backend.onrender.com/api/chat";
+const API_URL = "https://ai-assistant-backend-576t.onrender.com/api/chat";
 
 export default function App() {
   const [input, setInput] = useState("");
