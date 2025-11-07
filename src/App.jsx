@@ -2,19 +2,24 @@ import { useEffect, useRef, useState } from "react";
 import { Client } from "@gradio/client";
 
 /**
- * Diagnostic chat UI:
- * - Streams tokens if available.
- * - Tries multiple output shapes and both output orders.
- * - If no text is found, shows the RAW payload so we can see what the Space returns.
- * - No localStorage; includes Reset; shows a banner on network/auth errors.
+ * Robust chat UI for a Gradio Space using @gradio/client (queue + streaming).
+ * - Streams tokens if available; otherwise consumes final `data`.
+ * - Handles both output orders: [resp, state] OR [state, resp].
+ * - Watchdog avoids endless spinner if backend never yields final data.
+ * - If no printable text, shows raw payload for diagnosis.
+ * - No persistence; includes Reset and an error banner.
  */
 
+// ---- CONFIG ----
 const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
-const FN_ROUTE = "/chat";            // keep this for now; we can switch to "/chat_api" later
-const HF_TOKEN = import.meta.env.VITE_HF_TOKEN?.trim() || undefined;
+// If you created a clean API endpoint in the Space, use "/chat_api"; else keep "/chat".
+const FN_ROUTE = "/chat_api"; // <- change to "/chat" if you didn't add chat_api
+const HF_TOKEN = import.meta.env?.VITE_HF_TOKEN?.trim() || undefined; // optional (for Private Space)
 
-console.log("BUILD:", "gradio-diagnostic-frontend-OK");
+// Build marker
+console.log("BUILD:", "app-robust-2025-11-06");
 
+// ---- Keep HF state across turns (Space `gr.State`) ----
 function useHfState() {
   const ref = useRef(null);
   return {
@@ -24,6 +29,7 @@ function useHfState() {
   };
 }
 
+// ---- Extract readable assistant text from many shapes ----
 function extractAssistantText(resp) {
   if (resp == null) return null;
   if (typeof resp === "string") return resp;
@@ -63,13 +69,13 @@ function extractAssistantText(resp) {
         if (last.content && typeof last.content.text === "string") return last.content.text;
       }
     }
-    const lastPair = resp[resp.length - 1];
-    if (Array.isArray(lastPair) && typeof lastPair[1] === "string") return lastPair[1];
+    const pair = resp[resp.length - 1];
+    if (Array.isArray(pair) && typeof pair[1] === "string") return pair[1];
   }
-
   return null;
 }
 
+// ---- Figure out which tuple element is resp vs state ----
 function pickResponseAndState(tuple) {
   if (!Array.isArray(tuple)) return { resp: null, newState: undefined };
   const [a, b] = tuple;
@@ -83,72 +89,103 @@ function pickResponseAndState(tuple) {
     looksLikeMsgs(x) ||
     (x &&
       typeof x === "object" &&
-      ("text" in x || "answer" in x || "message" in x || "assistant" in x || "messages" in x || "value" in x));
+      ("text" in x ||
+        "answer" in x ||
+        "message" in x ||
+        "assistant" in x ||
+        "messages" in x ||
+        "value" in x));
 
-  if (looksLikeResp(a)) return { resp: a, newState: b }; // [resp, state]
-  if (looksLikeResp(b)) return { resp: b, newState: a }; // [state, resp]
+  // [resp, state]
+  if (looksLikeResp(a)) return { resp: a, newState: b };
+  // [state, resp]
+  if (looksLikeResp(b)) return { resp: b, newState: a };
+  // Fallback
   return { resp: a ?? b ?? null, newState: undefined };
 }
 
-async function callSpaceStreaming(message, hfState, onChunk, onRaw) {
-  const app = await Client.connect(SPACE_URL, HF_TOKEN ? { hf_token: HF_TOKEN } : undefined);
+// ---- Core streaming call (prevents endless spinner) ----
+async function callSpaceStreaming(message, hfState, onChunk) {
+  // 1) connect
+  let app;
+  try {
+    app = await Client.connect(SPACE_URL, HF_TOKEN ? { hf_token: HF_TOKEN } : undefined);
+  } catch (e) {
+    throw new Error(`Cannot connect to Space. ${e?.message || e}`);
+  }
 
+  // 2) submit job
   const job = await app.submit(FN_ROUTE, [
     message,
     hfState.get(),
     "You are a friendly Chatbot.",
-    512,
-    0.7,
-    0.95,
+    512,   // max new tokens
+    0.7,   // temperature
+    0.95,  // top-p
   ]);
 
+  // 3) stream
   let finalText = "";
   let nextState;
   let anyPayload = false;
 
-  for await (const ev of job) {
-    // Uncomment once if you want to see exact event shapes:
-    // console.debug("gradio event:", ev);
+  // watchdog: if nothing arrives, bail with a helpful error
+  const WATCH_MS = 45000;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+  }, WATCH_MS);
 
-    if (ev.type === "token") {
-      anyPayload = true;
-      if (typeof ev.data === "string") {
-        finalText += ev.data;
-        onChunk?.(finalText);
+  try {
+    for await (const ev of job) {
+      if (timedOut) {
+        throw new Error(
+          "The Space didn't return any tokens or final data within 45s. " +
+          "This usually means the function isn't yielding or returning outputs."
+        );
       }
-    } else if (ev.type === "data") {
-      anyPayload = true;
-      const { resp, newState } = pickResponseAndState(ev.data ?? []);
-      if (newState !== undefined) nextState = newState;
 
-      // Try to convert to displayable text
-      let text =
-        extractAssistantText(resp) ??
-        (resp != null ? null : null); // leave null so we can show RAW below
+      if (ev.type === "token") {
+        anyPayload = true;
+        if (typeof ev.data === "string") {
+          finalText += ev.data;
+          onChunk?.(finalText);
+        }
+      } else if (ev.type === "data") {
+        anyPayload = true;
+        const { resp, newState } = pickResponseAndState(ev.data ?? []);
+        if (newState !== undefined) nextState = newState;
 
-      if (typeof text === "string" && text.length) {
-        finalText = text;
-        onChunk?.(finalText);
-      } else {
-        // No printable text -> show raw payload to diagnose
-        const rawPretty = "🧪 Raw payload:\n" + JSON.stringify(resp, null, 2);
-        finalText = rawPretty;
-        onChunk?.(finalText);
-        onRaw?.(resp);
-      }
-    } else if (ev.type === "error") {
-      throw new Error(ev.data || "Gradio error");
+        const text = extractAssistantText(resp);
+        if (typeof text === "string" && text.length) {
+          finalText = text;     // final authoritative text
+          onChunk?.(finalText);
+        } else {
+          // Show raw payload for diagnosis so we don't "hang"
+          finalText = "🧪 Raw payload:\n" + JSON.stringify(resp, null, 2);
+          onChunk?.(finalText);
+        }
+      } else if (ev.type === "error") {
+        throw new Error(ev.data || "Gradio error");
+      } // else: status/log are optional to show
     }
+  } finally {
+    clearTimeout(timer);
   }
 
   if (nextState !== undefined) hfState.set(nextState);
+
   if (!anyPayload) {
-    throw new Error("Space returned no tokens or final data. The /chat function may not be returning outputs.");
+    throw new Error(
+      "No tokens or final data were received from the Space. " +
+      "Check that the function returns (text, state) or (messages, state), and that it's exposed at the route in FN_ROUTE."
+    );
   }
 
   return finalText || null;
 }
 
+// ---- UI ----
 export default function App() {
   const hfState = useHfState();
 
@@ -193,15 +230,13 @@ export default function App() {
     try {
       setIsTyping(true);
       setBanner(null);
-      await callSpaceStreaming(
-        text,
-        hfState,
-        (partial) => replaceLastAssistant(partial),
-        (raw) => console.log("🧪 RAW RESP:", raw)
-      );
+      const out = await callSpaceStreaming(text, hfState, (partial) => {
+        replaceLastAssistant(partial);
+      });
+      if (!out) replaceLastAssistant("⚠️ No text returned.");
     } catch (err) {
       console.error(err);
-      replaceLastAssistant("⚠️ Connection or Space error. See banner.");
+      replaceLastAssistant("⚠️ Backend didn't return a usable reply. See banner.");
       setBanner(String(err?.message || err));
     } finally {
       setIsTyping(false);
@@ -253,7 +288,7 @@ export default function App() {
             placeholder="Type your message…"
             className="flex-1 px-4 py-3 rounded-lg bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
-          <button
+        <button
             type="submit"
             className="px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 font-semibold"
           >
