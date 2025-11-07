@@ -1,19 +1,96 @@
 import { useEffect, useRef, useState } from "react";
 
 /**
- * Chat UI powered by your HF Space backend. Includes:
- * - Local history persistence (localStorage)
- * - Typing/streaming simulation
- * - Abort ongoing request
- *
- * NOTE on TRUE streaming:
- * Gradio's /run/predict typically returns a full JSON at once.
- * This code simulates token streaming. If you later expose an SSE/WebSocket
- * or chunked endpoint, wire it in `sendToBackend(true)` paths.
+ * ChatGPT-style UI + Hugging Face Space (Gradio v5)
+ * - Calls /gradio_api/call/chat with the 6 expected inputs
+ * - Persists HF conversation state across turns
+ * - Typing animation (simulated streaming)
  */
+
+const HF_ROOT = "https://torresjchristopher-ai-assistant.hf.space/gradio_api";
+const HF_FN = "chat";
+const STORAGE_KEY = "ai-assistant-chat:v1";
+
+// ---- HF call helpers -------------------------------------------------------
+
+function useHfState() {
+  const ref = useRef(null); // gradio "state" value between turns
+  return {
+    get: () => ref.current,
+    set: (v) => (ref.current = v),
+  };
+}
+
+// Try to pull a readable string from common Gradio result shapes
+function extractAssistantText(resp) {
+  if (resp == null) return "No response in payload.";
+  if (typeof resp === "string") return resp;
+  if (typeof resp.text === "string") return resp.text;
+  if (typeof resp.answer === "string") return resp.answer;
+  if (typeof resp.message === "string") return resp.message;
+  if (typeof resp.assistant === "string") return resp.assistant;
+  if (Array.isArray(resp) && typeof resp[1] === "string") return resp[1];
+  // Fallback: show JSON so you can see the exact shape and refine
+  return JSON.stringify(resp);
+}
+
+async function callHuggingFace(message, hfState) {
+  const payload = {
+    data: [
+      message,                      // textbox
+      hfState.get(),                // state (null on first call)
+      "You are a friendly Chatbot.",// system message (customize if you want)
+      512,                          // max new tokens
+      0.7,                          // temperature
+      0.95                          // top-p
+    ],
+  };
+
+  let res = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  // Cold start retry
+  if (!res.ok && res.status === 503) {
+    await new Promise((r) => setTimeout(r, 1200));
+    res = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  const json = await res.json();      // { data: [response, new_state] }
+  const [resp, newState] = json?.data ?? [];
+  if (newState !== undefined) hfState.set(newState);
+
+  return extractAssistantText(resp);
+}
+
+// Typing effect (simulated streaming)
+function typeOut(fullText, cps = 18, onUpdate) {
+  const delay = 60; // ms
+  return new Promise((resolve) => {
+    let i = 0;
+    let buf = "";
+    const t = setInterval(() => {
+      buf += fullText.slice(i, i + cps);
+      i += cps;
+      onUpdate(buf);
+      if (i >= fullText.length) {
+        clearInterval(t);
+        resolve();
+      }
+    }, delay);
+  });
+}
+
+// ---- UI --------------------------------------------------------------------
+
 export default function App() {
-  const API_URL = "https://torresjchristopher-ai-assistant.hf.space/run/predict";
-  const STORAGE_KEY = "ai-assistant-chat:v1";
+  const hfState = useHfState();
 
   const [messages, setMessages] = useState(() => {
     try {
@@ -28,15 +105,14 @@ export default function App() {
 
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [pendingText, setPendingText] = useState("");
-  const abortRef = useRef(null);
   const chatRef = useRef(null);
 
-  // persist on change
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-    // keep scrolled to bottom
-    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
+    chatRef.current?.scrollTo({
+      top: chatRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [messages]);
 
   function append(role, content) {
@@ -45,102 +121,45 @@ export default function App() {
 
   function replaceLastAssistant(newContent) {
     setMessages((m) => {
-      const copy = [...m];
-      // find last assistant message (typically the last one)
-      for (let i = copy.length - 1; i >= 0; i--) {
-        if (copy[i].role === "assistant") {
-          copy[i] = { ...copy[i], content: newContent };
+      const arr = [...m];
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i].role === "assistant") {
+          arr[i] = { ...arr[i], content: newContent };
           break;
         }
       }
-      return copy;
-    });
-  }
-
-  function cancelCurrent() {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setIsTyping(false);
-    setPendingText("");
-  }
-
-  async function sendToBackend(userText, simulateStreaming = true) {
-    // Abort any prior
-    cancelCurrent();
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      const res = await fetch(API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: [userText] }),
-        signal: controller.signal,
-      });
-
-      const payload = await res.json();
-      const full = payload?.data?.[0] ?? "Sorry — no response was returned.";
-
-      if (!simulateStreaming) {
-        // instant message: no typing sim
-        append("assistant", full);
-        setIsTyping(false);
-        return;
-      }
-
-      // typing/streaming simulation
-      setIsTyping(true);
-      append("assistant", ""); // create an empty assistant bubble
-      await typeOut(full, 18, (chunk) => {
-        replaceLastAssistant(chunk);
-      });
-      setIsTyping(false);
-    } catch (err) {
-      if (err.name === "AbortError") return;
-      append("assistant", "⚠️ Connection error.");
-      setIsTyping(false);
-    } finally {
-      abortRef.current = null;
-    }
-  }
-
-  // progressively writes out the text to simulate streaming
-  function typeOut(fullText, cps = 18, onUpdate) {
-    // cps ~ characters per 60ms chunk; adjust below
-    const delay = 60; // ms
-    return new Promise((resolve) => {
-      let i = 0;
-      let buffer = "";
-      const timer = setInterval(() => {
-        // add ~cps characters per tick
-        buffer += fullText.slice(i, i + cps);
-        i += cps;
-        onUpdate(buffer);
-        if (i >= fullText.length) {
-          clearInterval(timer);
-          resolve();
-        }
-      }, delay);
+      return arr;
     });
   }
 
   async function onSubmit(e) {
     e.preventDefault();
-    const content = input.trim();
-    if (!content) return;
+    const text = input.trim();
+    if (!text) return;
 
-    append("user", content);
+    append("user", text);
     setInput("");
 
-    // Send with simulated streaming; flip to false if you want instant answers
-    sendToBackend(content, true);
+    // Call HF Space -> get full response string
+    try {
+      const full = await callHuggingFace(text, hfState);
+
+      // typing/streaming simulation
+      setIsTyping(true);
+      append("assistant", "");
+      await typeOut(full, 18, (chunk) => replaceLastAssistant(chunk));
+    } catch (err) {
+      console.error(err);
+      append("assistant", "⚠️ Connection error.");
+    } finally {
+      setIsTyping(false);
+    }
   }
 
   function clearChat() {
-    cancelCurrent();
     setMessages([{ role: "assistant", content: "Chat cleared. How can I help?" }]);
     localStorage.removeItem(STORAGE_KEY);
+    hfState.set(null);
   }
 
   return (
@@ -148,20 +167,12 @@ export default function App() {
       {/* Top bar */}
       <header className="flex items-center justify-between px-4 py-3 bg-gray-800 border-b border-gray-700">
         <h1 className="text-lg font-semibold">AI Assistant</h1>
-        <div className="flex gap-2">
-          <button
-            onClick={clearChat}
-            className="px-3 py-1.5 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
-          >
-            Clear
-          </button>
-          <button
-            onClick={cancelCurrent}
-            className="px-3 py-1.5 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
-          >
-            Stop
-          </button>
-        </div>
+        <button
+          onClick={clearChat}
+          className="px-3 py-1.5 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
+        >
+          Clear
+        </button>
       </header>
 
       {/* Messages */}
@@ -169,8 +180,8 @@ export default function App() {
         ref={chatRef}
         className="flex-1 overflow-y-auto p-4 md:p-6 space-y-3 bg-gray-900"
       >
-        {messages.map((m, idx) => (
-          <Message key={idx} role={m.role} content={m.content} />
+        {messages.map((m, i) => (
+          <Message key={i} role={m.role} content={m.content} />
         ))}
         {isTyping && (
           <div className="max-w-[80%] bg-gray-800 rounded-2xl p-3 text-gray-300">
