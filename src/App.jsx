@@ -1,18 +1,26 @@
 import { useEffect, useRef, useState } from "react";
+import { client } from "@gradio/client";
 
 /**
- * Chat UI wired to a Gradio v5 Space using event_id + streaming.
- * - POST /gradio_api/call/chat  → { event_id }
- * - GET  /gradio_api/stream/chat?event_id=...  (SSE via fetch/ReadableStream)
- * - No localStorage persistence.
+ * Chat UI wired to a Gradio v5 Space using the official JS client.
+ * - The client handles queueing/stream protocols automatically.
+ * - We call the exported function name: "/chat".
+ * - No localStorage persistence (reload = fresh chat).
  */
 
-const HF_ROOT = "https://torresjchristopher-ai-assistant.hf.space/gradio_api";
-const HF_FN = "chat";
+const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
+const FN_ROUTE = "/chat"; // matches api_name in your config
+
+// --------------- Singleton Gradio client -----------------
+let _appPromise = null;
+async function getGradioApp() {
+  if (!_appPromise) _appPromise = client(SPACE_URL);
+  return _appPromise;
+}
 
 // ---------------------- HF state between turns -------------------------------
 function useHfState() {
-  const ref = useRef(null); // Space "state" object
+  const ref = useRef(null); // Space "state" object between turns
   return {
     get: () => ref.current,
     set: (v) => (ref.current = v),
@@ -23,7 +31,6 @@ function useHfState() {
 // ------------------------- Extractor for common shapes -----------------------
 function extractAssistantText(resp) {
   if (resp == null) return null;
-
   if (typeof resp === "string") return resp;
 
   if (typeof resp === "object") {
@@ -32,7 +39,7 @@ function extractAssistantText(resp) {
     if (typeof resp.message === "string") return resp.message;
     if (typeof resp.assistant === "string") return resp.assistant;
 
-    // Chat-style shapes
+    // Chat-style: { messages: [{role, content}, ...] }
     if (Array.isArray(resp.messages)) {
       const last = [...resp.messages].reverse().find((m) => m?.role === "assistant");
       if (last) {
@@ -41,9 +48,11 @@ function extractAssistantText(resp) {
       }
     }
 
+    // Array of messages OR [["user","..."],["assistant","..."]]
     if (Array.isArray(resp)) {
-      // Array of message objects
-      const looksLikeMsgs = resp.every((m) => m && typeof m === "object" && "role" in m && "content" in m);
+      const looksLikeMsgs = resp.every(
+        (m) => m && typeof m === "object" && "role" in m && "content" in m
+      );
       if (looksLikeMsgs) {
         const last = [...resp].reverse().find((m) => m.role === "assistant");
         if (last) {
@@ -51,12 +60,11 @@ function extractAssistantText(resp) {
           if (last.content && typeof last.content.text === "string") return last.content.text;
         }
       }
-      // Pair format: ["role","content"]
-      const lastPair = resp[resp.length - 1];
-      if (Array.isArray(lastPair) && typeof lastPair[1] === "string") return lastPair[1];
+      const pair = resp[resp.length - 1];
+      if (Array.isArray(pair) && typeof pair[1] === "string") return pair[1];
     }
 
-    // ComponentMessage { value: ... }
+    // ComponentMessage: { value: ... }
     if (resp.value) {
       const v = resp.value;
       if (typeof v === "string") return v;
@@ -70,152 +78,24 @@ function extractAssistantText(resp) {
   return null;
 }
 
+// ------------------------ Call Space via @gradio/client ----------------------
+async function callSpace(message, hfState) {
+  const app = await getGradioApp();
+  // Predict returns the final result; the client takes care of the queue.
+  const result = await app.predict(FN_ROUTE, [
+    message,                 // textbox
+    hfState.get(),           // state (null on first call)
+    "You are a friendly Chatbot.", // system message
+    512,                     // max new tokens
+    0.7,                     // temperature
+    0.95,                    // top-p
+  ]);
 
-// ------------------------ Streaming via fetch + SSE --------------------------
-async function streamOrPollHf(message, hfState, { onChunk } = {}) {
-  // 1) Request -> event_id
-  const payload = {
-    data: [message, hfState.get(), "You are a friendly Chatbot.", 512, 0.7, 0.95],
-  };
-
-  let callRes;
-  try {
-    callRes = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    return { finalText: null, raw: { error: "network_call", detail: String(e) } };
-  }
-
-  if (!callRes.ok && callRes.status === 503) {
-    await new Promise((r) => setTimeout(r, 1200));
-    return streamOrPollHf(message, hfState, { onChunk });
-  }
-
-  let callJson;
-  try {
-    callJson = await callRes.json();
-  } catch {
-    return { finalText: null, raw: { error: "parse_call", status: callRes.status } };
-  }
-
-  const eventId = callJson?.event_id;
-  // Some Spaces return final data directly:
-  if (!eventId) {
-    const direct = callJson?.data;
-    if (Array.isArray(direct) && direct.length) {
-      const [resp, newState] = direct;
-      if (newState !== undefined) hfState.set(newState);
-      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: callJson };
-    }
-    return { finalText: null, raw: callJson };
-  }
-
-  // 2) Try streaming endpoints in order
-  const streamUrls = [
-    `${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`,
-    `${HF_ROOT}/stream/${encodeURIComponent(eventId)}`, // alt pattern
-  ];
-
-  for (const url of streamUrls) {
-    const streamed = await trySseFetch(url, hfState, onChunk);
-    if (streamed?.ok) return { finalText: streamed.finalText ?? null, raw: { stream_url: url } };
-    // if it failed with 405/404, we’ll fall through to results
-  }
-
-  // 3) Poll possible result endpoints
-  const resultUrls = [
-    `${HF_ROOT}/result/${encodeURIComponent(eventId)}`,
-    `${HF_ROOT}/result/${HF_FN}/${encodeURIComponent(eventId)}`, // alt pattern
-  ];
-
-  const started = Date.now();
-  const TIMEOUT_MS = 20_000;
-  while (Date.now() - started < TIMEOUT_MS) {
-    for (const rurl of resultUrls) {
-      try {
-        const r = await fetch(rurl);
-        if (r.ok) {
-          const j = await r.json();
-          if (Array.isArray(j?.data)) {
-            const [resp, newState] = j.data;
-            if (newState !== undefined) hfState.set(newState);
-            const text = extractAssistantText(resp) ?? JSON.stringify(resp);
-            return { finalText: text, raw: { result_url: rurl } };
-          }
-        }
-      } catch {}
-    }
-    await new Promise((r) => setTimeout(r, 800));
-  }
-
-  // 4) Nothing worked – surface the event_id for backend tuning
-  return { finalText: null, raw: { error: "no_stream_or_result", event_id: eventId } };
-}
-
-// Helper: parse SSE via fetch + ReadableStream
-async function trySseFetch(url, hfState, onChunk) {
-  let res;
-  try {
-    res = await fetch(url, { headers: { Accept: "text/event-stream" } });
-  } catch (e) {
-    return { ok: false, error: "stream_connect", detail: String(e) };
-  }
-  if (!res.ok) {
-    return { ok: false, error: "stream_status", status: res.status };
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) return { ok: false, error: "no_reader" };
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finalText = "";
-  let newStateCaptured = undefined;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? "";
-
-      for (const f of frames) {
-        const dataLine = f.split("\n").find((l) => l.startsWith("data:"));
-        if (!dataLine) continue;
-        const jsonStr = dataLine.replace(/^data:\s*/, "").trim();
-        if (!jsonStr) continue;
-
-        let obj;
-        try { obj = JSON.parse(jsonStr); } catch { continue; }
-
-        const delta = obj?.data?.delta ?? obj?.delta ?? obj?.chunk ?? obj?.token;
-        if (typeof delta === "string" && delta) {
-          finalText += delta;
-          onChunk?.(finalText);
-          continue;
-        }
-        if (Array.isArray(obj?.data)) {
-          const [resp, newState] = obj.data;
-          if (newState !== undefined) newStateCaptured = newState;
-          const text = extractAssistantText(resp) ?? JSON.stringify(resp);
-          if (text) {
-            finalText = text;
-            onChunk?.(finalText);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    return { ok: false, error: "stream_read", detail: String(e) };
-  }
-
-  if (newStateCaptured !== undefined) hfState.set(newStateCaptured);
-  return { ok: true, finalText };
+  // Expect: { data: [resp, new_state] }
+  const [resp, newState] = result?.data ?? [];
+  if (newState !== undefined) hfState.set(newState);
+  const text = extractAssistantText(resp);
+  return { text: text ?? null, raw: result };
 }
 
 // ------------------------------- UI -----------------------------------------
@@ -263,22 +143,18 @@ export default function App() {
     append("user", text);
     setInput("");
 
-append("assistant", "");
-
-try {
-  setIsTyping(true);
-  const { finalText, raw } = await streamOrPollHf(text, hfState, {
-    onChunk: (chunk) => replaceLastAssistant(chunk),
-  });
-  if (!finalText) {
-    replaceLastAssistant(`🔎 Debug: ${JSON.stringify(raw, null, 2)}`);
-  }
-} catch (err) {
-  console.error(err);
-  replaceLastAssistant("⚠️ Connection error.");
-} finally {
-  setIsTyping(false);
-}
+    try {
+      setIsTyping(true);
+      append("assistant", "");
+      const { text: respText, raw } = await callSpace(text, hfState);
+      const finalText = respText ?? `🔎 Debug: ${JSON.stringify(raw, null, 2)}`;
+      replaceLastAssistant(finalText);
+    } catch (err) {
+      console.error(err);
+      replaceLastAssistant("⚠️ Connection error.");
+    } finally {
+      setIsTyping(false);
+    }
   }
 
   function resetConversation() {
