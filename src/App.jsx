@@ -4,20 +4,116 @@ import { useEffect, useRef, useState } from "react";
 const HF_ROOT = "https://torresjchristopher-ai-assistant.hf.space/gradio_api";
 const HF_FN = "chat";
 
-// No localStorage persistence (per request). History lives only in state
-// and will vanish on refresh. A future toggle can re-enable it easily.
-
-function useHfState() {
-  const ref = useRef(null); // gradio state between turns
-  return {
-    get: () => ref.current,
-    set: (v) => (ref.current = v),
-    reset: () => (ref.current = null),
+// ---- Streaming helpers -----------------------------------------------------
+// Try true SSE streaming first, fall back to a result endpoint if needed.
+async function streamHuggingFace(message, hfState, { onChunk } = {}) {
+  // 1) Kick off the job -> event_id
+  const payload = {
+    data: [
+      message,
+      hfState.get(),
+      "You are a friendly Chatbot.",
+      512,
+      0.7,
+      0.95,
+    ],
   };
+
+  const callRes = await fetch(`${HF_ROOT}/call/${HF_FN}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!callRes.ok && callRes.status === 503) {
+    await new Promise((r) => setTimeout(r, 1200));
+    return streamHuggingFace(message, hfState, { onChunk });
+  }
+  const callJson = await callRes.json();
+  const eventId = callJson?.event_id;
+  if (!eventId) {
+    // Some Spaces still return data directly (rare). Handle that too.
+    const direct = callJson?.data;
+    if (Array.isArray(direct) && direct.length) {
+      const [resp, newState] = direct;
+      if (newState !== undefined) hfState.set(newState);
+      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: callJson };
+    }
+    return { finalText: null, raw: callJson };
+  }
+
+  // 2) Try EventSource streaming
+  let buffer = "";
+  let resolved = false;
+
+  const result = await new Promise((resolve) => {
+    let es;
+    try {
+      es = new EventSource(`${HF_ROOT}/stream/${HF_FN}?event_id=${encodeURIComponent(eventId)}`);
+    } catch (e) {
+      resolve(null);
+      return;
+    }
+
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        // Common patterns:
+        // - { data: [resp, new_state] } (final)
+        // - { data: { delta: "text" } } (chunk)
+        // - { delta: "text" } or { chunk: "text" } (chunk)
+        // - { type: "complete" } (done)
+        if (Array.isArray(data?.data)) {
+          const [resp, newState] = data.data;
+          if (newState !== undefined) hfState.set(newState);
+          const text = extractAssistantText(resp) ?? JSON.stringify(resp);
+          buffer = text; // ensure we have the final
+          return; // keep listening for a completion signal
+        }
+        const delta = data?.data?.delta ?? data?.delta ?? data?.chunk ?? data?.token;
+        if (typeof delta === "string" && delta) {
+          buffer += delta;
+          onChunk?.(buffer);
+        }
+        if (data?.type === "complete" || data?.event === "end" || data?.done === true) {
+          if (!resolved) {
+            resolved = true;
+            es.close();
+            resolve({ finalText: buffer || null, raw: data });
+          }
+        }
+      } catch (_) {
+        // Non-JSON keep-alives; ignore
+      }
+    };
+
+    es.onerror = () => {
+      if (!resolved) {
+        es.close();
+        resolve(null); // fall back to /result
+      }
+    };
+  });
+
+  if (result) return result;
+
+  // 3) Fallback: poll a likely result endpoint
+  try {
+    const res2 = await fetch(`${HF_ROOT}/result/${eventId}`);
+    if (res2.ok) {
+      const j = await res2.json();
+      const [resp, newState] = j?.data ?? [];
+      if (newState !== undefined) hfState.set(newState);
+      return { finalText: extractAssistantText(resp) ?? JSON.stringify(resp), raw: j };
+    }
+  } catch (_) {}
+
+  // 4) Last resort: return the event id for debugging
+  return { finalText: null, raw: { event_id: eventId } };
 }
 
 // Robust extractor for common Gradio response shapes.
-function extractAssistantText(resp) {
+function extractAssistantText(resp)(resp) {
   if (resp == null) return null;
 
   if (typeof resp === "string") return resp;
