@@ -2,22 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { Client } from "@gradio/client";
 
 /**
- * Chat UI using @gradio/client (queue + streaming).
- * - Space must be Public; if Private, set VITE_HF_TOKEN and we’ll pass it.
- * - Calls the function route "/chat" with 6 inputs (msg, state, system, max_tok, temp, top_p).
- * - Streams tokens when available; otherwise handles final `data` event.
- * - Robust to output order: [resp, state] OR [state, resp].
- * - No localStorage persistence; includes Reset.
+ * Diagnostic chat UI:
+ * - Streams tokens if available.
+ * - Tries multiple output shapes and both output orders.
+ * - If no text is found, shows the RAW payload so we can see what the Space returns.
+ * - No localStorage; includes Reset; shows a banner on network/auth errors.
  */
 
 const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
-const FN_ROUTE = "/chat";
+const FN_ROUTE = "/chat";            // keep this for now; we can switch to "/chat_api" later
 const HF_TOKEN = import.meta.env.VITE_HF_TOKEN?.trim() || undefined;
 
-// Build marker so we can verify this exact bundle
-console.log("BUILD:", "gradio-client-queue-stream-OK-iterable+robust");
+console.log("BUILD:", "gradio-diagnostic-frontend-OK");
 
-// ---------------- HF state between turns (Space `state` component) -----------
 function useHfState() {
   const ref = useRef(null);
   return {
@@ -27,7 +24,6 @@ function useHfState() {
   };
 }
 
-// ---------------- Extract assistant text from varied shapes -------------------
 function extractAssistantText(resp) {
   if (resp == null) return null;
   if (typeof resp === "string") return resp;
@@ -74,7 +70,6 @@ function extractAssistantText(resp) {
   return null;
 }
 
-// ---------- Decide which tuple element is response vs. state ------------------
 function pickResponseAndState(tuple) {
   if (!Array.isArray(tuple)) return { resp: null, newState: undefined };
   const [a, b] = tuple;
@@ -90,28 +85,14 @@ function pickResponseAndState(tuple) {
       typeof x === "object" &&
       ("text" in x || "answer" in x || "message" in x || "assistant" in x || "messages" in x || "value" in x));
 
-  // Case 1: [resp, state]
-  if (looksLikeResp(a)) return { resp: a, newState: b };
-  // Case 2: [state, resp]
-  if (looksLikeResp(b)) return { resp: b, newState: a };
-  // Fallback
+  if (looksLikeResp(a)) return { resp: a, newState: b }; // [resp, state]
+  if (looksLikeResp(b)) return { resp: b, newState: a }; // [state, resp]
   return { resp: a ?? b ?? null, newState: undefined };
 }
 
-// --------------- Core: call Space via Client, stream tokens/data -------------
-async function callSpaceStreaming(message, hfState, onChunk) {
-  let app;
-  try {
-    app = await Client.connect(SPACE_URL, HF_TOKEN ? { hf_token: HF_TOKEN } : undefined);
-  } catch (e) {
-    throw new Error(
-      `Cannot connect to Space (${SPACE_URL}). ` +
-      `Reason: ${e?.message || e || "unknown"}. ` +
-      `If the Space is Private, add VITE_HF_TOKEN in a .env file.`
-    );
-  }
+async function callSpaceStreaming(message, hfState, onChunk, onRaw) {
+  const app = await Client.connect(SPACE_URL, HF_TOKEN ? { hf_token: HF_TOKEN } : undefined);
 
-  // Submit job
   const job = await app.submit(FN_ROUTE, [
     message,
     hfState.get(),
@@ -123,57 +104,51 @@ async function callSpaceStreaming(message, hfState, onChunk) {
 
   let finalText = "";
   let nextState;
-  let sawAnyPayload = false;
+  let anyPayload = false;
 
-  // Optional: 45s watchdog — avoids “spinning forever”
-  const watchdog = setTimeout(() => {}, 45_000);
+  for await (const ev of job) {
+    // Uncomment once if you want to see exact event shapes:
+    // console.debug("gradio event:", ev);
 
-  try {
-    for await (const ev of job) {
-      // console.debug("gradio event:", ev); // uncomment for one run to inspect
-
-      if (ev.type === "token") {
-        sawAnyPayload = true;
-        if (typeof ev.data === "string") {
-          finalText += ev.data;
-          onChunk?.(finalText);
-        }
-      } else if (ev.type === "data") {
-        sawAnyPayload = true;
-        const { resp, newState } = pickResponseAndState(ev.data ?? []);
-        if (newState !== undefined) nextState = newState;
-
-        const text =
-          extractAssistantText(resp) ??
-          (resp != null ? JSON.stringify(resp) : null);
-
-        if (text) {
-          finalText = text;     // authoritative final text
-          onChunk?.(finalText); // flush to UI
-        }
-      } else if (ev.type === "error") {
-        throw new Error(ev.data || "Gradio error");
-      } else {
-        // status/log: optional to display (queue position, running, complete, etc.)
+    if (ev.type === "token") {
+      anyPayload = true;
+      if (typeof ev.data === "string") {
+        finalText += ev.data;
+        onChunk?.(finalText);
       }
+    } else if (ev.type === "data") {
+      anyPayload = true;
+      const { resp, newState } = pickResponseAndState(ev.data ?? []);
+      if (newState !== undefined) nextState = newState;
+
+      // Try to convert to displayable text
+      let text =
+        extractAssistantText(resp) ??
+        (resp != null ? null : null); // leave null so we can show RAW below
+
+      if (typeof text === "string" && text.length) {
+        finalText = text;
+        onChunk?.(finalText);
+      } else {
+        // No printable text -> show raw payload to diagnose
+        const rawPretty = "🧪 Raw payload:\n" + JSON.stringify(resp, null, 2);
+        finalText = rawPretty;
+        onChunk?.(finalText);
+        onRaw?.(resp);
+      }
+    } else if (ev.type === "error") {
+      throw new Error(ev.data || "Gradio error");
     }
-  } finally {
-    clearTimeout(watchdog);
   }
 
   if (nextState !== undefined) hfState.set(nextState);
-
-  if (!sawAnyPayload) {
-    throw new Error(
-      "No tokens or final data arrived from the Space. " +
-      "Double-check that the /chat function returns (response, state) or (state, response), and that the Space is Public."
-    );
+  if (!anyPayload) {
+    throw new Error("Space returned no tokens or final data. The /chat function may not be returning outputs.");
   }
 
   return finalText || null;
 }
 
-// ------------------------------------ UI -------------------------------------
 export default function App() {
   const hfState = useHfState();
 
@@ -182,7 +157,7 @@ export default function App() {
   ]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [banner, setBanner] = useState(null); // surface network/auth issues
+  const [banner, setBanner] = useState(null);
   const chatRef = useRef(null);
 
   useEffect(() => {
@@ -213,20 +188,21 @@ export default function App() {
 
     append("user", text);
     setInput("");
-    append("assistant", ""); // start empty bubble
+    append("assistant", ""); // create empty bubble
 
     try {
       setIsTyping(true);
       setBanner(null);
-      const out = await callSpaceStreaming(text, hfState, (partial) => {
-        replaceLastAssistant(partial);
-      });
-      if (!out) replaceLastAssistant("⚠️ No text returned.");
+      await callSpaceStreaming(
+        text,
+        hfState,
+        (partial) => replaceLastAssistant(partial),
+        (raw) => console.log("🧪 RAW RESP:", raw)
+      );
     } catch (err) {
       console.error(err);
-      const msg = String(err?.message || err);
-      replaceLastAssistant("⚠️ Connection or Space error.");
-      setBanner(msg);
+      replaceLastAssistant("⚠️ Connection or Space error. See banner.");
+      setBanner(String(err?.message || err));
     } finally {
       setIsTyping(false);
     }
