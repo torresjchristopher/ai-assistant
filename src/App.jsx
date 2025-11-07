@@ -1,77 +1,76 @@
 import React, { useState } from "react";
-import { Client } from "@gradio/client";
+import axios from "axios";
 
-function App() {
-  const [messages, setMessages] = useState([
-    { sender: "assistant", text: "Hi there 👋 How can I help you today?" },
-  ]);
+const API_URL = "https://your-backend.onrender.com/api/chat";
+
+export default function App() {
   const [input, setInput] = useState("");
+  const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  const handleSend = async () => {
+  async function sendMessage(e) {
+    e.preventDefault();
     if (!input.trim()) return;
-    const newMessages = [...messages, { sender: "user", text: input }];
-    setMessages(newMessages);
+
+    const newMessage = { user: input, bot: "..." };
+    const history = [...messages, newMessage];
+    setMessages(history);
     setInput("");
     setLoading(true);
 
     try {
-      const app = await Client.connect(
-        "https://torresjchristopher-ai-assistant-yukora.hf.space"
-      );
+      const res = await axios.post(API_URL, {
+        message: input,
+        history: messages,
+      });
 
-      const response = await app.predict("/chat", [input, null]);
-      const botReply =
-        response?.data?.[0]?.[1] ?? "⚠️ No response from backend.";
-
-      setMessages([...newMessages, { sender: "assistant", text: botReply }]);
-    } catch (err) {
-      console.error("Error:", err);
       setMessages([
-        ...newMessages,
-        { sender: "assistant", text: "⚠️ Connection error." },
+        ...history.slice(0, -1),
+        { user: input, bot: res.data.response },
       ]);
+    } catch (err) {
+      console.error("Chat error:", err);
+      setMessages([
+        ...history.slice(0, -1),
+        { user: input, bot: "⚠️ Error: could not connect." },
+      ]);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-  };
+  }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-6">
-      <div className="w-full max-w-2xl bg-gray-800 rounded-2xl shadow-xl p-6 flex flex-col">
-        <h1 className="text-2xl font-bold mb-4 text-center">AI Assistant</h1>
-        <div className="flex-1 overflow-y-auto mb-4 space-y-3">
-          {messages.map((m, i) => (
-            <div
-              key={i}
-              className={`p-3 rounded-xl max-w-[80%] ${
-                m.sender === "user"
-                  ? "bg-indigo-600 self-end ml-auto"
-                  : "bg-gray-700 self-start"
-              }`}
-            >
-              {m.text}
-            </div>
-          ))}
-        </div>
-        <div className="flex space-x-2">
-          <input
-            className="flex-1 p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none"
-            placeholder="Type a message..."
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSend()}
-          />
-          <button
-            onClick={handleSend}
-            disabled={loading}
-            className="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg text-white font-semibold"
-          >
-            {loading ? "..." : "Send"}
-          </button>
-        </div>
+    <div className="flex flex-col items-center min-h-screen bg-gray-900 text-gray-100 p-6">
+      <h1 className="text-3xl font-bold mb-4">AI Assistant</h1>
+      <div className="w-full max-w-2xl bg-gray-800 p-4 rounded-lg shadow-lg h-[70vh] overflow-y-auto mb-4">
+        {messages.map((msg, i) => (
+          <div key={i} className="mb-3">
+            <div className="font-semibold text-blue-400">You:</div>
+            <div className="ml-2">{msg.user}</div>
+            <div className="font-semibold text-green-400 mt-2">AI:</div>
+            <div className="ml-2 whitespace-pre-wrap">{msg.bot}</div>
+          </div>
+        ))}
+        {loading && <p className="text-sm text-gray-400">Thinking...</p>}
       </div>
+      <form
+        onSubmit={sendMessage}
+        className="w-full max-w-2xl flex gap-2 items-center"
+      >
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          className="flex-1 p-3 rounded-lg bg-gray-700 text-gray-100 outline-none"
+          placeholder="Type your message..."
+        />
+        <button
+          type="submit"
+          className="px-4 py-2 bg-blue-500 rounded-lg hover:bg-blue-600 disabled:opacity-50"
+          disabled={loading}
+        >
+          Send
+        </button>
+      </form>
     </div>
   );
 }
-
-export default App;
