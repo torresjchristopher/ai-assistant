@@ -1,19 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { client } from "@gradio/client";
+import { Client } from "@gradio/client";
 
 /**
- * Chat UI using @gradio/client queue/stream flow.
- * - Space must be Public (no token). If Private, pass { hf_token: "HF_..." } to client().
- * - We call the function route "/chat" (api_name in your Space config).
- * - Uses submit() + for-await events() to handle status/token/data events.
- * - No localStorage persistence.
+ * Chat UI using @gradio/client queue/stream flow (async-iterable Job).
+ * - Space must be Public (no token). For Private: Client.connect(url, { hf_token: "hf_..." }).
+ * - Calls function route "/chat".
+ * - Uses submit() and `for await (const ev of job)` to handle status/token/data events.
+ * - No localStorage persistence; includes Reset.
  */
 
 const SPACE_URL = "https://torresjchristopher-ai-assistant.hf.space";
 const FN_ROUTE = "/chat";
 
-// Build marker to verify you’re on this file
-console.log("BUILD:", "gradio-client-queue-stream-OK");
+// Build marker: verify this exact bundle is running in Console
+console.log("BUILD:", "gradio-client-queue-stream-OK-iterable");
 
 // ---------------------- HF state between turns -------------------------------
 function useHfState() {
@@ -76,14 +76,14 @@ function extractAssistantText(resp) {
 
 // ------------------------ Queue/stream call via @gradio/client ---------------
 async function callSpaceStreaming(message, hfState, onChunk) {
-  // If your Space is Private, pass token: client(SPACE_URL, { hf_token: "HF_xxx" })
-  const app = await client(SPACE_URL);
+  // If Private Space: const app = await Client.connect(SPACE_URL, { hf_token: "hf_..." });
+  const app = await Client.connect(SPACE_URL);
 
-  // Submit the job to the queue; Space will emit status/token/data events.
-  const session = await app.submit(FN_ROUTE, [
+  // Submit job to the queue
+  const job = await app.submit(FN_ROUTE, [
     message,                       // textbox
     hfState.get(),                 // state (null first call)
-    "You are a friendly Chatbot.", // system message (adjust as you want)
+    "You are a friendly Chatbot.", // system message
     512,                           // max new tokens
     0.7,                           // temperature
     0.95,                          // top-p
@@ -92,26 +92,25 @@ async function callSpaceStreaming(message, hfState, onChunk) {
   let finalText = "";
   let nextState;
 
-  for await (const ev of session.events()) {
-    // You’ll see these in DevTools if you log ev:
-    // { type: "status" | "token" | "data" | "log" | "error", ... }
+  // IMPORTANT: the job itself is async iterable — no .events()
+  for await (const ev of job) {
+    // Types: "status", "token", "data", "log", "error"
     if (ev.type === "token") {
-      // Streaming delta/token (some Spaces emit this)
       if (typeof ev.data === "string") {
         finalText += ev.data;
         onChunk?.(finalText);
       }
     } else if (ev.type === "data") {
-      // Final payload for this run: { data: [resp, new_state] }
+      // Final payload for this run: { data: [resp, state] }
       const [resp, newState] = ev.data ?? [];
       if (newState !== undefined) nextState = newState;
       const text = extractAssistantText(resp) ?? JSON.stringify(resp);
       finalText = text || finalText;
-      onChunk?.(finalText); // ensure UI shows final
+      onChunk?.(finalText);
     } else if (ev.type === "error") {
       throw new Error(ev.data || "Gradio error");
     } else {
-      // status/log: optional to display
+      // status/log -> optional to display; you can show a spinner if desired
       // console.debug("gradio event:", ev);
     }
   }
