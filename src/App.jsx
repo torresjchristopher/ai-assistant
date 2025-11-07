@@ -1,21 +1,30 @@
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
+import ChatBubble from "./components/ChatBubble.jsx";
 
 export default function App() {
   const [messages, setMessages] = useState([
-    { role: "assistant", content: "Hi there 👋 How can I help you today?" }
+    { role: "assistant", content: "👋 Hi there! What would you like to explore today?" },
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [dots, setDots] = useState(".");
   const chatEndRef = useRef(null);
 
   const API_BASE = "https://ai-assistant-backend-576t.onrender.com";
 
-  const scrollToBottom = () => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  useEffect(() => {
+    if (loading) {
+      const interval = setInterval(() => {
+        setDots((prev) => (prev.length < 3 ? prev + "." : "."));
+      }, 400);
+      return () => clearInterval(interval);
+    }
+  }, [loading]);
 
-  useEffect(scrollToBottom, [messages]);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   async function handleSend() {
     if (!input.trim()) return;
@@ -26,75 +35,68 @@ export default function App() {
 
     try {
       const res = await axios.post(`${API_BASE}/api/chat-stream`, {
-        message: input,
+        message: userMsg.content,
         history: messages,
       }, { responseType: "text" });
 
-      let accumulated = "";
-      const reader = res.data.split("\n");
+      let acc = "";
+      const lines = res.data.split("\n");
 
-      for (const chunk of reader) {
-        if (chunk.trim() === "") continue;
+      for (const line of lines) {
+        if (!line.trim()) continue;
         try {
-          const parsed = JSON.parse(chunk);
-          if (parsed.delta) {
-            accumulated += parsed.delta;
+          const json = JSON.parse(line);
+          if (json.delta) {
+            acc += json.delta;
             setMessages((m) => {
-              const newMsgs = [...m];
-              const last = newMsgs[newMsgs.length - 1];
-              if (last.role === "assistant") last.content = accumulated;
-              else newMsgs.push({ role: "assistant", content: accumulated });
-              return newMsgs;
+              const copy = [...m];
+              const last = copy[copy.length - 1];
+              if (last.role === "assistant") last.content = acc;
+              else copy.push({ role: "assistant", content: acc });
+              return copy;
             });
           }
         } catch {}
       }
     } catch (err) {
       console.error(err);
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: "⚠️ Connection error." },
-      ]);
+      setMessages((m) => [...m, { role: "assistant", content: "⚠️ Connection error." }]);
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
-      <header className="p-4 text-center font-semibold text-xl bg-white shadow-sm">
-        AI Assistant
+    <div className="flex flex-col h-screen bg-gradient-to-br from-gray-50 to-gray-100">
+      <header className="backdrop-blur-xl bg-white/60 border-b border-gray-200 shadow-sm p-5 text-center font-semibold text-lg">
+        Yukora AI Assistant
       </header>
 
-      <main className="flex-1 overflow-y-auto p-6 space-y-4">
+      <main className="flex-1 overflow-y-auto p-6 space-y-3">
         {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`p-3 max-w-[80%] rounded-2xl ${
-              msg.role === "user"
-                ? "bg-blue-600 text-white self-end ml-auto"
-                : "bg-gray-200 text-gray-800 self-start"
-            }`}
-          >
-            {msg.content}
-          </div>
+          <ChatBubble key={i} role={msg.role} content={msg.content} />
         ))}
+        {loading && (
+          <div className="flex items-center space-x-2 text-gray-500 text-sm ml-2">
+            <span className="animate-pulse">Thinking{dots}</span>
+          </div>
+        )}
         <div ref={chatEndRef} />
       </main>
 
-      <footer className="p-4 bg-white flex items-center space-x-2 shadow-inner">
+      <footer className="border-t border-gray-200 backdrop-blur-xl bg-white/70 p-4 flex items-center space-x-2">
         <input
           type="text"
+          placeholder="Type something..."
+          className="flex-1 rounded-full border border-gray-300 px-4 py-2 focus:outline-none focus:ring focus:ring-blue-200"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleSend()}
-          placeholder="Type your message..."
-          className="flex-1 border border-gray-300 rounded-lg px-4 py-2 focus:ring focus:ring-blue-200"
         />
         <button
           onClick={handleSend}
           disabled={loading}
-          className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-2 rounded-full hover:opacity-90 disabled:opacity-50"
         >
           Send
         </button>
@@ -102,3 +104,4 @@ export default function App() {
     </div>
   );
 }
+
