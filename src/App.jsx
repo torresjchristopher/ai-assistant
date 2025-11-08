@@ -29,14 +29,18 @@ export default function App() {
   async function handleSend() {
     if (!input.trim()) return;
     const userMsg = { role: "user", content: input };
-    setMessages((m) => [...m, userMsg]);
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
     setInput("");
     setLoading(true);
+
+    // Add placeholder for assistant message
+    setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
     try {
       const res = await axios.post(`${API_BASE}/api/chat-stream`, {
         message: userMsg.content,
-        history: messages,
+        history: newMessages.filter(m => m.content), // Only send messages with content
       }, { responseType: "text" });
 
       let acc = "";
@@ -51,16 +55,38 @@ export default function App() {
             setMessages((m) => {
               const copy = [...m];
               const last = copy[copy.length - 1];
-              if (last.role === "assistant") last.content = acc;
-              else copy.push({ role: "assistant", content: acc });
+              if (last.role === "assistant") {
+                last.content = acc;
+              }
               return copy;
             });
           }
-        } catch {}
+        } catch (e) {
+          console.warn("Failed to parse line:", line);
+        }
+      }
+
+      // If no content was accumulated, show error
+      if (!acc) {
+        setMessages((m) => {
+          const copy = [...m];
+          const last = copy[copy.length - 1];
+          if (last.role === "assistant") {
+            last.content = "⚠️ No response received from server.";
+          }
+          return copy;
+        });
       }
     } catch (err) {
-      console.error(err);
-      setMessages((m) => [...m, { role: "assistant", content: "⚠️ Connection error." }]);
+      console.error("API Error:", err);
+      setMessages((m) => {
+        const copy = [...m];
+        const last = copy[copy.length - 1];
+        if (last.role === "assistant") {
+          last.content = `⚠️ Connection error: ${err.message}`;
+        }
+        return copy;
+      });
     } finally {
       setLoading(false);
     }
@@ -74,7 +100,7 @@ export default function App() {
 
       <main className="flex-1 overflow-y-auto p-6 space-y-3">
         {messages.map((msg, i) => (
-          <ChatBubble key={i} role={msg.role} content={msg.content} />
+          <ChatBubble key={i} sender={msg.role} text={msg.content} />
         ))}
         {loading && (
           <div className="flex items-center space-x-2 text-gray-500 text-sm ml-2">
@@ -96,7 +122,7 @@ export default function App() {
         <button
           onClick={handleSend}
           disabled={loading}
-          className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-2 rounded-full hover:opacity-90 disabled:opacity-50"
+          className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-2 rounded-full hover:opacity-90 disabled:opacity-50 transition-opacity"
         >
           Send
         </button>
@@ -104,4 +130,3 @@ export default function App() {
     </div>
   );
 }
-
