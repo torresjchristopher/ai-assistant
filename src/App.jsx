@@ -1,33 +1,26 @@
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
-import ChatBubble from "./components/ChatBubble.jsx";
+import { motion, AnimatePresence } from "framer-motion";
+import ChatMessage from "./components/ChatMessage";
+import InputArea from "./components/InputArea";
+import WelcomeScreen from "./components/WelcomeScreen";
 
 export default function App() {
-  const [messages, setMessages] = useState([
-    { role: "assistant", content: "👋 Hi there! What would you like to explore today?" },
-  ]);
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [dots, setDots] = useState(".");
   const chatEndRef = useRef(null);
+  const messagesContainerRef = useRef(null);
 
   const API_BASE = "https://ai-assistant-backend-576t.onrender.com";
-
-  useEffect(() => {
-    if (loading) {
-      const interval = setInterval(() => {
-        setDots((prev) => (prev.length < 3 ? prev + "." : "."));
-      }, 400);
-      return () => clearInterval(interval);
-    }
-  }, [loading]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  async function handleSend() {
-    if (!input.trim()) return;
+  const handleSend = async () => {
+    if (!input.trim() || loading) return;
+
     const userMsg = { role: "user", content: input };
     const newMessages = [...messages, userMsg];
     setMessages(newMessages);
@@ -38,10 +31,14 @@ export default function App() {
     setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
     try {
-      const res = await axios.post(`${API_BASE}/api/chat-stream`, {
-        message: userMsg.content,
-        history: newMessages.filter(m => m.content), // Only send messages with content
-      }, { responseType: "text" });
+      const res = await axios.post(
+        `${API_BASE}/api/chat-stream`,
+        {
+          message: userMsg.content,
+          history: newMessages.filter((m) => m.content),
+        },
+        { responseType: "text" }
+      );
 
       let acc = "";
       const lines = res.data.split("\n");
@@ -66,7 +63,6 @@ export default function App() {
         }
       }
 
-      // If no content was accumulated, show error
       if (!acc) {
         setMessages((m) => {
           const copy = [...m];
@@ -90,43 +86,63 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   return (
-    <div className="flex flex-col h-screen bg-gradient-to-br from-gray-50 to-gray-100">
-      <header className="backdrop-blur-xl bg-white/60 border-b border-gray-200 shadow-sm p-5 text-center font-semibold text-lg">
-        Yukora AI Assistant
+    <div className="flex flex-col h-screen bg-[#0A0A0A] text-white">
+      {/* Header */}
+      <header className="border-b border-white/5 backdrop-blur-xl bg-black/40 sticky top-0 z-50">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+              </div>
+              <span className="text-lg font-semibold bg-gradient-to-r from-white to-white/60 bg-clip-text text-transparent">
+                Yukora
+              </span>
+            </div>
+            <button className="text-sm text-white/60 hover:text-white/90 transition-colors px-3 py-1.5 rounded-lg hover:bg-white/5">
+              New chat
+            </button>
+          </div>
+        </div>
       </header>
 
-      <main className="flex-1 overflow-y-auto p-6 space-y-3">
-        {messages.map((msg, i) => (
-          <ChatBubble key={i} sender={msg.role} text={msg.content} />
-        ))}
-        {loading && (
-          <div className="flex items-center space-x-2 text-gray-500 text-sm ml-2">
-            <span className="animate-pulse">Thinking{dots}</span>
-          </div>
-        )}
-        <div ref={chatEndRef} />
+      {/* Messages Area */}
+      <main
+        ref={messagesContainerRef}
+        className="flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8"
+      >
+        <div className="max-w-4xl mx-auto py-8">
+          <AnimatePresence mode="popLayout">
+            {messages.length === 0 ? (
+              <WelcomeScreen onSuggestionClick={setInput} />
+            ) : (
+              messages.map((msg, i) => (
+                <ChatMessage
+                  key={i}
+                  role={msg.role}
+                  content={msg.content}
+                  isLatest={i === messages.length - 1}
+                  isStreaming={loading && i === messages.length - 1}
+                />
+              ))
+            )}
+          </AnimatePresence>
+          <div ref={chatEndRef} />
+        </div>
       </main>
 
-      <footer className="border-t border-gray-200 backdrop-blur-xl bg-white/70 p-4 flex items-center space-x-2">
-        <input
-          type="text"
-          placeholder="Type something..."
-          className="flex-1 rounded-full border border-gray-300 px-4 py-2 focus:outline-none focus:ring focus:ring-blue-200"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSend()}
-        />
-        <button
-          onClick={handleSend}
-          disabled={loading}
-          className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-2 rounded-full hover:opacity-90 disabled:opacity-50 transition-opacity"
-        >
-          Send
-        </button>
-      </footer>
+      {/* Input Area */}
+      <InputArea
+        input={input}
+        setInput={setInput}
+        onSend={handleSend}
+        loading={loading}
+      />
     </div>
   );
 }
